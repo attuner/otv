@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Live TV Stream</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100vw;
+      width: 100dvw;
+      height: 100vh;
+      height: 100dvh;
+      background: #000;
+      overflow: hidden;
+    }
+
+    /* Clean full-screen video stream */
+    #tv-stream {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      background: #000;
+    }
+
+    /* Minimal initial click-to-start overlay required by browser autoplay policies */
+    #start-overlay {
+      position: fixed;
+      inset: 0;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 999;
+      cursor: pointer;
+    }
+
+    #start-btn {
+      padding: 16px 36px;
+      font-size: 1.1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      background: #2563eb;
+      color: #fff;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Single Full-Screen Video Stream Element -->
+  <video id="tv-stream" autoplay playsinline muted controls></video>
+
+  <!-- Initial User Interaction Overlay -->
+  <div id="start-overlay">
+    <button id="start-btn">Start Live TV</button>
+  </div>
+
+  <script>
+    const CONFIG_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxAWmgaZ0wdkFcPcSFuMMUkqPutrGfkxg6jcWqlK5kCsnGuE2G5GXTFHznNudEzuV-pfQ/exec";
+    const STORAGE_KEY = "live_tv_schedule_v1";
+
+    const DEFAULT_SCHEDULE = [
+      { 
+        startTime: "00:00", 
+        endTime: "23:59", 
+        title: "Default TV Stream", 
+        url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" 
+      }
+    ];
+
+    let schedule = [];
+    let activeChannel = null;
+    let hlsInstance = null;
+
+    const video = document.getElementById("tv-stream");
+
+    function initializeScheduleData() {
+      const cached = localStorage.getItem(STORAGE_KEY);
+      if (cached) {
+        try {
+          schedule = JSON.parse(cached);
+          if (schedule.length > 0) return;
+        } catch (e) {
+          console.warn("Storage parse error:", e);
+        }
+      }
+      schedule = [...DEFAULT_SCHEDULE];
+    }
+
+    function toMinutes(t) {
+      if (!t) return 0;
+      const parts = t.toString().trim().split(":");
+      return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+    }
+
+    function getScheduledChannel() {
+      if (!schedule || schedule.length === 0) return null;
+      const now = new Date();
+      const current = now.getHours() * 60 + now.getMinutes();
+
+      return schedule.find(item => {
+        const start = toMinutes(item.startTime);
+        const end = toMinutes(item.endTime);
+        if (start < end) return current >= start && current < end;
+        if (start > end) return current >= start || current < end; // spans midnight
+        return true;
+      }) || schedule[0];
+    }
+
+    function playStream(channel) {
+      if (!channel || (activeChannel && activeChannel.url === channel.url)) return;
+      activeChannel = channel;
+
+      if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+      }
+
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+
+      let streamUrl = channel.url.trim();
+      if (location.protocol === "https:" && streamUrl.startsWith("http://")) {
+        streamUrl = streamUrl.replace("http://", "https://");
+      }
+
+      if (streamUrl.includes(".m3u8") && video.canPlayType("application/vnd.apple.mpegurl")) {
+        // Native HLS (Safari, iOS, iPadOS)
+        video.src = streamUrl;
+        video.play().catch(e => console.warn("Native playback pending gesture:", e));
+      } else if (streamUrl.includes(".m3u8") && Hls.isSupported()) {
+        // Hls.js fallback (Chrome, Firefox, Android, Edge)
+        hlsInstance = new Hls({ enableWorker: true, lowLatencyMode: true });
+        hlsInstance.loadSource(streamUrl);
+        hlsInstance.attachMedia(video);
+        hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+          video.play().catch(e => console.warn("HLS playback pending gesture:", e));
+        });
+      } else {
+        // Standard video file or stream (.mp4, direct stream)
+        video.src = streamUrl;
+        video.play().catch(e => console.warn("Direct stream pending gesture:", e));
+      }
+    }
+
+    function evaluateSchedule() {
+      const scheduled = getScheduledChannel();
+      if (scheduled) {
+        playStream(scheduled);
+      }
+    }
+
+    async function loadScheduleFromSheet() {
+      if (!CONFIG_APPS_SCRIPT_URL) return;
+      try {
+        const res = await fetch(CONFIG_APPS_SCRIPT_URL);
+        const data = await res.json();
+        if (data && data.channels && data.channels.length > 0) {
+          schedule = data.channels;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(schedule));
+          evaluateSchedule();
+        }
+      } catch (err) {
+        console.warn("Could not refresh from Google Sheet:", err.message);
+      }
+    }
+
+    function startTV() {
+      document.getElementById("start-overlay").style.display = "none";
+      video.muted = false; // Unmute on explicit user interaction
+
+      try {
+        const elem = document.documentElement;
+        if (elem.requestFullscreen) elem.requestFullscreen().catch(() => {});
+        else if (elem.webkitRequestFullscreen) elem.webkitRequestFullscreen().catch(() => {});
+      } catch (e) {}
+
+      initializeScheduleData();
+      evaluateSchedule();
+
+      // Fetch schedule from Google Sheet immediately and poll for changes every 3 minutes
+      loadScheduleFromSheet();
+      setInterval(loadScheduleFromSheet, 180000);
+
+      // Check current time against schedule every 5 seconds to switch streams on time
+      setInterval(evaluateSchedule, 5000);
+    }
+
+    const startBtn = document.getElementById("start-btn");
+    startBtn.addEventListener("click", startTV);
+    startBtn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.keyCode === 13) startTV();
+    });
+  </script>
+</body>
+</html>
